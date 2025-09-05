@@ -78,7 +78,7 @@ class PicRater(Star):
             yield event.image_result(img_url)
             hint = (
                 f"ID: {iid}\n分类: {category}\n文件: {fname}\n"
-                f"评分指令：#/评分 <分值> [备注]\n[请打分，分值0~5，优先抽取打分次数少的图]\n示例：#/评分 4 颜色舒服"
+                f"评分指令：#评分 <分值> [备注]\n[请打分，分值0~5，优先抽取打分次数少的图]\n示例：#评分 4 颜色舒服"
             )
             yield event.plain_result(hint)
         except Exception as e:
@@ -234,7 +234,7 @@ class PicRater(Star):
                 yield event.plain_result("没有检测到分类（顶级子文件夹）。")
                 return
             joined = "、".join(cats[:100])
-            yield event.plain_result(f"顶级分类（前{min(100,len(cats))}个）：\n{joined}\n例如：#/来一张 {cats[0]}")
+            yield event.plain_result(f"顶级分类（前{min(100,len(cats))}个）：\n{joined}\n例如：#来一张 {cats[0]}")
         except Exception as e:
             logger.error(f"[pic_rater] /图类目 失败: {e}")
             yield event.plain_result("获取分类失败：请检查 picapi 是否在线。")
