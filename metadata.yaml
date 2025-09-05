@@ -1,0 +1,9 @@
+name: astrbot_plugin_pic_rater
+desc: 随机抽图 + 打分写入EXIF/元数据（支持按分类）
+version: 0.1.0
+author: nero
+repo: https://example.com/repo
+tags:
+  - 图片
+  - 随机
+  - 评分

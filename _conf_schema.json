@@ -1,0 +1,7 @@
+{
+  "PICAPI_URL": {
+    "type": "string",
+    "default": "http://picapi:8000",
+    "description": "图片 API 基址（容器内访问）"
+  }
+}
