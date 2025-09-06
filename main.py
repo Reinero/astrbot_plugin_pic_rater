@@ -5,6 +5,33 @@ import httpx
 from astrbot.api import logger
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register
+import re
+
+_CAT_HINT_RE = re.compile(r"[,:/]")
+
+def _build_random_params(arg_text: str) -> dict:
+    """
+    把“#来一张”后面的参数转成 /random_pic 的查询参数：
+    - 以 '?' 或 'q:' 开头：走 q（模糊搜索/FTS）
+    - 含 , : / 任一字符：判为 cat（分类/权重/多级）
+    - 其他：默认 q
+    """
+    t = (arg_text or "").strip()
+    if not t:
+        return {}  # 纯随机
+
+    low = t.lower()
+    if low.startswith("?"):
+        return {"q": t[1:].strip()}
+    if low.startswith("q:"):
+        return {"q": t[2:].strip()}
+
+    if _CAT_HINT_RE.search(t):
+        return {"cat": t}
+
+    # 默认当作搜索关键词
+    return {"q": t}
+
 
 
 @register(
@@ -63,28 +90,43 @@ class PicRater(Star):
     # 用法：#来一张   或   #来一张 风景:3,人像:1   或   #来一张 壁纸/风景
     @filter.command("来一张")
     async def cmd_send_random(self, event, text: str = ""):
-        cat = (text or "").strip() or None
+        # ★ 新：把用户参数转成 q 或 cat
+        params = _build_random_params(text)
+
         try:
-            data = await self._get("/random_pic", cat=cat)
+            # ★ 原来是 cat=cat；现在改成 **params
+            data = await self._get("/random_pic", **params)
+
             img_url = self._abs_url(data["url"])
             iid = data.get("id")
-            relpath = data.get("relpath")  # ★ 取出 relpath
+            relpath = data.get("relpath")
             fname = data.get("filename", "")
             category = data.get("category") or "*"
 
-            # ★ 同时保存 id 和 relpath，后续评分更稳
+            # ★ 同时保存 id 和 relpath，评分更稳（后端 /rate 兼容二者）
             self.last_sent[self._session_key(event)] = {"id": iid, "relpath": relpath}
 
             yield event.image_result(img_url)
-            hint = (
-                f"ID: {iid}\n分类: {category}\n文件: {fname}\n"
-                f"评分指令：#评分 <分值> [备注]\n[请打分，分值0~5，优先抽取打分次数少的图]\n示例：#评分 4 颜色舒服"
-            )
-            yield event.plain_result(hint)
+
+            # 可选：给用户一个提示
+            hint_lines = [
+                f"ID: {iid}",
+                f"分类: {category}",
+                f"文件: {fname}",
+                "评分指令：#评分 <分值> [备注]（0~5，可小数；写回XMP会四舍五入为整数）",
+            ]
+            # 根据模式追加一行提示
+            if "q" in params:
+                hint_lines.append(f"检索：{params['q']}")
+            elif "cat" in params:
+                hint_lines.append(f"分类表达式：{params['cat']}")
+            yield event.plain_result("\n".join(hint_lines))
+
         except Exception as e:
             from astrbot.api import logger
             logger.error(f"[pic_rater] /来一张 失败: {e}")
-            yield event.plain_result("发图失败：请检查 picapi 是否在线、分类是否存在（或查看控制台日志）。")
+            # 404 场景常见是“q 没命中”或“cat 不存在”
+            yield event.plain_result("发图失败：没有匹配到图片，或 picapi 不可用。请更换关键词/分类或查看控制台日志。")
 
     # === 放在 PicRater 类里，和其它方法同级 ===
 
@@ -113,63 +155,100 @@ class PicRater(Star):
         t = (text or "").strip().lower()
         return t in {"清理", "purge", "cleanup", "clean", "true", "1", "是", "yes"}
 
-    @filter.command("重建索引")
-    async def cmd_reindex(self, event, text: str = ""):
-        purge = self._parse_purge_flag(text)
-        try:
-            resp = await self._reindex(purge)
-            indexed = resp.get("indexed")
-            purged = resp.get("purged")
-            msg = f"索引已更新：扫描入库 {indexed} 条"
-            if purged is not None:
-                msg += f"；清理 {purged} 条"
-            msg += "。"
-            yield event.plain_result(msg)
-        except Exception as e:
-            yield event.plain_result(f"索引更新失败：{e}")
 
-    # —— 别名：更新图库 / 刷新图库 / reindex ——
-    @filter.command("更新图库")
-    async def cmd_update_gallery(self, event, text: str = ""):
-        purge = self._parse_purge_flag(text)
-        try:
-            resp = await self._reindex(purge)
-            indexed = resp.get("indexed");
-            purged = resp.get("purged")
-            msg = f"索引已更新：扫描入库 {indexed} 条"
-            if purged is not None: msg += f"；清理 {purged} 条"
-            msg += "。"
-            yield event.plain_result(msg)
-        except Exception as e:
-            yield event.plain_result(f"索引更新失败：{e}")
 
-    @filter.command("刷新图库")
-    async def cmd_refresh_gallery(self, event, text: str = ""):
-        purge = self._parse_purge_flag(text)
-        try:
-            resp = await self._reindex(purge)
-            indexed = resp.get("indexed");
-            purged = resp.get("purged")
-            msg = f"索引已更新：扫描入库 {indexed} 条"
-            if purged is not None: msg += f"；清理 {purged} 条"
-            msg += "。"
-            yield event.plain_result(msg)
-        except Exception as e:
-            yield event.plain_result(f"索引更新失败：{e}")
+    # ====== 加在 PicRater 类里（与其它方法同级）======
 
-    @filter.command("reindex")
-    async def cmd_reindex_alias(self, event, text: str = ""):
-        purge = self._parse_purge_flag(text)
+    async def _sync_subjects_all(self, batch: int = 800) -> int:
+        """
+        分批调用 /sync_subjects?limit=...，直到处理完。
+        返回总处理条数。
+        """
+        import httpx
+        total = 0
+        url = f"{self.base_url}/sync_subjects"
+        async with httpx.AsyncClient(timeout=None) as client:
+            while True:
+                r = await client.post(url, params={"limit": batch})
+                r.raise_for_status()
+                js = r.json()
+                n = int(js.get("processed", 0))
+                total += n
+                # 批次回报（可选）
+                if n > 0 and total % (batch * 5) == 0:
+                    # 这里不直接 yield，返回给上层统一回复
+                    pass
+                if n < batch:  # 小于批量，说明已处理完
+                    break
+        return total
+
+    async def _rebuild_fts_safe(self) -> str:
+        import httpx
         try:
-            resp = await self._reindex(purge)
-            indexed = resp.get("indexed");
-            purged = resp.get("purged")
-            msg = f"索引已更新：扫描入库 {indexed} 条"
-            if purged is not None: msg += f"；清理 {purged} 条"
-            msg += "。"
-            yield event.plain_result(msg)
+            async with httpx.AsyncClient(timeout=None) as client:
+                r = await client.post(f"{self.base_url}/admin/rebuild_fts", params={"full": "true"})
+                if r.status_code == 200:
+                    # 有的后端返回JSON，有的返回空体，这里不强制解析
+                    return "FTS 已重建"
+                return f"FTS 重建返回 {r.status_code}"
         except Exception as e:
-            yield event.plain_result(f"索引更新失败：{e}")
+            return f"FTS 重建跳过（{e}）"
+
+    def _parse_cleanup_batch_fts(self, text: str):
+        """
+        解析“清理/批大小/fts”参数：
+          - 清理：中文“清理”、英文 'purge'/'clean'/'cleanup'/'true'/'yes'/'1'
+          - 批大小：第一个纯数字词
+          - fts：包含 'fts' 字样则尝试重建 FTS
+        """
+        t = (text or "").strip().lower()
+        tokens = t.split()
+        purge = any(tok in {"清理", "purge", "cleanup", "clean", "true", "yes", "1"} for tok in tokens)
+        batch = next((int(tok) for tok in tokens if tok.isdigit()), 800)
+        want_fts = any("fts" in tok for tok in tokens)
+        return purge, batch, want_fts
+
+    @filter.command("整理图库")
+    async def cmd_maintain_gallery(self, event, text: str = ""):
+        """
+        一键维护：
+          1) /reindex（可带清理）
+          2) /sync_subjects 分批同步 XMP Subject
+          3) （可选）重建 FTS
+        用法：
+          #整理图库
+          #整理图库 清理
+          #整理图库 清理 1000
+          #整理图库 1000 fts
+        """
+        purge, batch, want_fts = self._parse_cleanup_batch_fts(text)
+        try:
+            # 1) 扫盘入库（可清理）
+            r1 = await self._reindex(purge)
+            indexed = r1.get("indexed")
+            purged  = r1.get("purged")
+
+            # 2) 分批同步 XMP
+            total = await self._sync_subjects_all(batch=batch)
+
+            # 3) 可选 FTS 重建
+            fts_msg = ""
+            if want_fts:
+                fts_msg = await self._rebuild_fts_safe()
+
+            # 汇总消息
+            lines = [
+                f"已扫描入库：{indexed} 张",
+                f"已清理：{purged or 0} 条" if purged is not None else "未执行清理",
+                f"已同步 XMP 标签：{total} 张（批大小 {batch}）",
+            ]
+            if fts_msg:
+                lines.append(fts_msg)
+
+            yield event.plain_result("\n".join(lines))
+        except Exception as e:
+            yield event.plain_result(f"整理失败：{e}")
+
 
     # 用法：#/评分 4.5   或   #/评分 4 不错
     @filter.command("评分")

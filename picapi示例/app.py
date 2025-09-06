@@ -5,17 +5,19 @@ from pathlib import Path
 from typing import Optional, List, Tuple
 import os, random, sqlite3, time, hashlib, urllib.parse, subprocess, math
 import json
-import os
-from typing import List, Optional
 from fastapi import Body  # 新增：用于接收 JSON body
 from pydantic import BaseModel, Field
+import shlex
+from fastapi import Query
 
-
-
+# 过滤：把我们写回的内部评分标签排除掉
+_TAG_BLACKLIST_PREFIXES = ("score:", "count:")
+_TAG_BLACKLIST_FIXED = {"rated"}
 
 PICK_BIAS = os.environ.get("PICK_BIAS", "min").lower()      # off|min|weighted
 PICK_BIAS_ALPHA = float(os.environ.get("PICK_BIAS_ALPHA", "1.0"))  # weighted 的指数
 
+FTS_TABLE = os.environ.get("FTS_TABLE", "images_fts")
 
 GALLERY_DIR = Path(os.environ.get("GALLERY_DIR", "/data/gallery")).resolve()
 STATIC_PREFIX = os.environ.get("STATIC_PREFIX", "/static")
@@ -48,12 +50,22 @@ def get_counts_for_rels(rels: List[str]) -> List[int]:
                 out_map[row["relpath"]] = int(row["cnt"])
     return [out_map.get(r, 0) for r in rels]
 
+def _assert_fts5_available():
+    try:
+        with db() as conn:
+            conn.execute("CREATE VIRTUAL TABLE IF NOT EXISTS __fts5_probe USING fts5(x)")
+            conn.execute("DROP TABLE __fts5_probe")
+    except Exception as e:
+        raise RuntimeError("SQLite 未启用 FTS5，无法使用全文索引") from e
 
 def db():
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA busy_timeout=5000;")  # 新增：最多等 5s
     conn.row_factory = sqlite3.Row
     return conn
+
+
 
 def init_db():
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -79,16 +91,7 @@ def init_db():
         );""")
 init_db()
 
-def _init_indices():
-    with db() as conn:
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_images_relpath ON images(relpath)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_images_cnt ON images(cnt)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_images_cat ON images(category)")
-        conn.commit()
 
-@app.on_event("startup")
-def _on_startup():
-    _init_indices()
 
 
 def list_all_files(root: Path) -> List[Path]:
@@ -237,7 +240,158 @@ def write_metadata(abs_path: Path, avg: float, cnt: int):
         # 如需排查可打印 e.stderr
         pass
 
-# —— 放在文件靠上位置，和现有 db() 一起 ——
+#------------
+
+def _extract_subjects_from_file(abs_path: Path) -> list[str]:
+    """
+    用 exiftool 读取 XMP:Subject，返回纯净的标签列表（过滤我们内部的评分标签）。
+    """
+    try:
+        # -j json输出；只取 XMP:Subject；-s 简洁键名；文件路径用 str(abs_path)
+        cmd = ["exiftool", "-j", "-s", "-XMP:Subject", str(abs_path)]
+        out = subprocess.check_output(cmd, stderr=subprocess.DEVNULL)
+        arr = json.loads(out.decode("utf-8", "ignore"))
+        if not arr:
+            return []
+        subs = arr[0].get("Subject")
+        if not subs:
+            return []
+        clean = []
+        for t in subs:
+            tl = str(t).strip()
+            tlc = tl.lower()
+            if tlc in _TAG_BLACKLIST_FIXED:
+                continue
+            if any(tlc.startswith(p) for p in _TAG_BLACKLIST_PREFIXES):
+                continue
+            clean.append(tl)
+        return clean
+    except Exception:
+        return []
+
+def _upsert_tags(conn, relpath: str, tags: list[str]):
+    # 幂等：先清，再插
+    conn.execute("DELETE FROM image_tags WHERE relpath=?", (relpath,))
+    rows = [(relpath, t, t.lower()) for t in tags]
+    if rows:
+        conn.executemany("INSERT OR IGNORE INTO image_tags(relpath, tag, tag_lc) VALUES (?,?,?)", rows)
+
+@app.post("/sync_subjects")
+def sync_subjects(limit: int = 0):
+    """
+    扫描数据库中的图片，读取 XMP:Subject 写入 image_tags。
+    limit>0 时只处理最近的 N 条（按 rowid DESC，便于分批）。
+    """
+    with db() as conn:
+        if limit and limit > 0:
+            cur = conn.execute("SELECT relpath FROM images ORDER BY rowid DESC LIMIT ?", (limit,))
+        else:
+            cur = conn.execute("SELECT relpath FROM images")
+        rels = [r[0] for r in cur.fetchall()]
+
+        n = 0
+        for rel in rels:
+            abs_path = (GALLERY_DIR / rel).resolve()
+            tags = _extract_subjects_from_file(abs_path)
+            _upsert_tags(conn, rel, tags)
+            n += 1
+            if n % 200 == 0:
+                conn.commit()
+        conn.commit()
+    return {"processed": len(rels)}
+
+#------------
+def _drop_legacy_objs(conn: sqlite3.Connection):
+    """
+    ⚠️ 强力清理：无条件删除数据库里所有触发器和视图。
+    目的：彻底清掉任何可能引用历史 SQL（如 T.tags / image_tags_norm）的对象。
+    """
+    rows = conn.execute("""
+        SELECT name, type
+          FROM sqlite_master
+         WHERE type IN ('view','trigger')
+    """).fetchall()
+    for name, typ in rows:
+        if typ == 'view':
+            conn.execute(f"DROP VIEW IF EXISTS {name}")
+        else:
+            conn.execute(f"DROP TRIGGER IF EXISTS {name}")
+
+    # 不返回任何东西，只负责清空
+
+
+
+#------------ 彻底稳妥的 FTS 初始化（无 t.tags/T.tags）------------
+def _init_fts_schema():
+    _assert_fts5_available()
+    with db() as conn:
+        _drop_legacy_objs(conn)
+
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS image_tags(
+          relpath TEXT NOT NULL,
+          tag     TEXT NOT NULL,
+          tag_lc  TEXT NOT NULL,
+          PRIMARY KEY(relpath, tag)
+        )""")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_image_tags_tag_lc ON image_tags(tag_lc)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_image_tags_relpath ON image_tags(relpath)")
+
+        try: conn.execute("ALTER TABLE images ADD COLUMN filename TEXT")
+        except Exception: pass
+        for (rel,) in conn.execute("SELECT relpath FROM images WHERE filename IS NULL OR filename=''"):
+            conn.execute("UPDATE images SET filename=? WHERE relpath=?", (Path(rel).name, rel))
+
+        conn.execute(f"""
+        CREATE VIRTUAL TABLE IF NOT EXISTS {FTS_TABLE} USING fts5(
+          relpath, filename, tags,
+          content='images', content_rowid='rowid',
+          tokenize='unicode61'
+        )""")
+
+        conn.execute(f"""
+        INSERT INTO {FTS_TABLE}(rowid, relpath, filename, tags)
+        SELECT i.rowid, i.relpath, COALESCE(i.filename,''), ''
+          FROM images AS i
+         WHERE i.rowid NOT IN (SELECT rowid FROM {FTS_TABLE})
+        """)
+        conn.commit()
+
+
+
+
+
+#---------------------------
+def _fts_query_from_kw(text: str) -> str:
+    s = (text or "").strip()
+    if not s:
+        return ""
+    import shlex
+    try:
+        parts = shlex.split(s)
+    except Exception:
+        parts = s.split()
+
+    def is_ascii(tok: str) -> bool:
+        try:
+            tok.encode("ascii")
+            return True
+        except Exception:
+            return False
+
+    out = []
+    for tok in parts:
+        tok = tok.strip()
+        if not tok:
+            continue
+        if " " in tok:            # 短语原样
+            out.append(f'"{tok}"')
+        else:                     # 仅 ASCII 加 *
+            out.append(tok + "*" if is_ascii(tok) else tok)
+    return " ".join(out)
+
+
+
 def _init_indices():
     with db() as conn:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_images_relpath ON images(relpath)")
@@ -245,10 +399,84 @@ def _init_indices():
         conn.execute("CREATE INDEX IF NOT EXISTS idx_images_cat ON images(category)")
         conn.commit()
 
-# —— 如果你已有 startup 事件，就在里面调用 _init_indices()；没有就加这个 ——
+
+@app.post("/admin/nuke_legacy")
+def admin_nuke_legacy():
+    """
+    仅清理旧视图/触发器；不会动任何表。
+    目的：把所有可能引用 T.tags / image_tags_norm 的东西清干净。
+    """
+    with db() as conn:
+        _drop_legacy_objs(conn)
+        conn.commit()
+    return {"ok": True, "done": "dropped legacy views/triggers"}
+
+
 @app.on_event("startup")
 def _on_startup():
     _init_indices()
+    if os.environ.get("SKIP_FTS_INIT"):
+        return
+    _init_fts_schema()
+
+
+
+@app.post("/admin/rebuild_fts")
+def admin_rebuild_fts(full: bool = True):
+    try:
+        with db() as conn:
+            _drop_legacy_objs(conn)
+            conn.commit()
+
+            if full:
+                to_drop = [FTS_TABLE,
+                           f"{FTS_TABLE}_data",
+                           f"{FTS_TABLE}_idx",
+                           f"{FTS_TABLE}_docsize",
+                           f"{FTS_TABLE}_config"]
+                for t in to_drop:
+                    conn.execute(f"DROP TABLE IF EXISTS {t}")
+                conn.commit()
+
+        _init_fts_schema()
+
+        # 回填 tags（只从 image_tags.tag 聚合）
+        with db() as conn:
+            conn.execute(f"""
+                UPDATE {FTS_TABLE}
+                   SET tags = COALESCE((
+                       SELECT GROUP_CONCAT(image_tags.tag, ' ')
+                         FROM image_tags
+                        WHERE image_tags.relpath = {FTS_TABLE}.relpath
+                   ), '')
+            """)
+            conn.commit()
+
+        return {"ok": True, "fts": FTS_TABLE}
+
+    except Exception as e:
+        # 把真实错误抛给客户端，便于你直接看到原因
+        raise HTTPException(status_code=500, detail=f"rebuild_fts failed: {e}")
+
+
+
+@app.post("/admin/refresh_fts_tags")
+def admin_refresh_fts_tags():
+    with db() as conn:
+        conn.execute(f"""
+            UPDATE {FTS_TABLE}
+               SET tags = COALESCE((
+                   SELECT GROUP_CONCAT(image_tags.tag, ' ')
+                     FROM image_tags
+                    WHERE image_tags.relpath = {FTS_TABLE}.relpath
+               ), '')
+        """)
+        conn.commit()
+    return {"ok": True, "fts": FTS_TABLE}
+
+
+
+
 
 
 @app.post("/reindex")
@@ -269,15 +497,15 @@ def reindex(purge_missing: bool = Body(default=False, description="是否删除�
     inserted = 0
     purged = 0
     with db() as conn:
-        # 2) 批量补充插入（已存在则忽略，不覆盖评分/次数）
-        rows = [(r, _top_category_of(r)) for r in all_relpaths]
-        # 分批以免 SQL 参数过多
+        # 2) 批量补充插入（已存在则忽略，不覆盖评分/次数）-------------------------------
+        rows = [(file_id_for(r), r, _top_category_of(r), Path(r).name) for r in all_relpaths]
         for i in range(0, len(rows), 800):
-            chunk = rows[i:i+800]
+            chunk = rows[i:i + 800]
             conn.executemany(
-                "INSERT OR IGNORE INTO images(relpath, category) VALUES (?, ?)",
+                "INSERT OR IGNORE INTO images(id, relpath, category, filename) VALUES (?, ?, ?, ?)",
                 chunk
             )
+
         conn.commit()
         # 统计本次“确实新增”的数量
         cur = conn.execute("SELECT COUNT(*) FROM images")
@@ -323,22 +551,55 @@ def categories():
 @app.get("/random_pic")
 def random_pic(
     cat: Optional[str] = Query(default=None, description="分类过滤，支持权重：风景 或 风景,人像 或 风景:3,人像:1；支持多级：壁纸/风景"),
-    redirect: bool = Query(default=False, description="是否302直跳图片直链"),
-    bias: Optional[str] = Query(default=None, description="择图偏好：off|min|weighted；默认取环境变量 PICK_BIAS"),
-    alpha: Optional[float] = Query(default=None, description="weighted 时的指数，默认取环境变量 PICK_BIAS_ALPHA"),
+    q:   Optional[str] = Query(default=None, description="全文搜索关键字（路径/文件名/标签）"),
+    redirect: bool = False,
+    bias: Optional[str] = None,
+    alpha: Optional[float] = None,
 ):
-    # 先按分类收集候选文件
+    import random
+
+    # ① 带 q：用 LIKE 做检索 → 从前200里随机挑一张（避免 ORDER BY RANDOM() 全表扫）
+    if q and q.strip():
+        terms = _split_terms(q)
+        where_sql, args = _build_like_where_and_args(terms)
+        with db() as conn:
+            cur = conn.execute(
+                f"""
+                SELECT i.relpath, i.id, i.category, i.filename, i.cnt, i.avg
+                FROM images i
+                WHERE {where_sql}
+                ORDER BY i.cnt ASC, i.avg DESC
+                LIMIT 200
+                """,
+                args
+            )
+            items = cur.fetchall()
+        if not items:
+            raise HTTPException(status_code=404, detail="No images matched the query.")
+        row = random.choice(items)
+        relpath, iid, category, filename, cnt, avg = row
+        url = to_url(relpath)
+        payload = {
+            "id": iid,
+            "relpath": relpath,
+            "filename": filename or relpath.split("/")[-1],
+            "category": category,
+            "url": url,
+        }
+        if redirect:
+            return RedirectResponse(url=url, status_code=302)
+        return JSONResponse(payload)
+
+    # ② 没有 q：保持你原来的“分类/权重 + 少评优先/加权/纯随机”的本地文件逻辑
     if cat:
         weighted = parse_weighted_cats(cat)
         chosen = choice_by_weight(weighted)
         files = collect_in_category(chosen)
         if not files:
-            # 兼容：如果权重首选分类没图，就尝试列表里的其它分类
             for name, _ in weighted:
                 cand = collect_in_category(name)
                 if cand:
-                    files = cand
-                    chosen = name
+                    files, chosen = cand, name
                     break
             else:
                 raise HTTPException(404, "No images under given categories.")
@@ -350,40 +611,38 @@ def random_pic(
     if not files:
         raise HTTPException(404, "No images in gallery.")
 
-    # 计算每张候选图的相对路径 & 评分次数
     rels_all = [p.relative_to(GALLERY_DIR).as_posix() for p in files]
     cnts = get_counts_for_rels(rels_all)
 
-    # 确定策略：请求参数优先生效，否则用环境变量，最后默认 off
     eff_bias = (bias or PICK_BIAS or "off").lower()
     eff_alpha = float(alpha if (alpha is not None) else PICK_BIAS_ALPHA)
-    if eff_alpha < 0.0001:
-        eff_alpha = 0.0001
+    eff_alpha = max(eff_alpha, 0.0001)
 
-    # 选择索引 idx
     if eff_bias == "min":
-        # 只在“评分次数最少”的集合里随机
         min_cnt = min(cnts)
         candidates = [i for i, c in enumerate(cnts) if c == min_cnt]
         idx = random.choice(candidates)
     elif eff_bias == "weighted":
-        # 加权随机：权重 = 1 / (cnt + 1)^alpha
         weights = [1.0 / ((c + 1.0) ** eff_alpha) for c in cnts]
         idx = random.choices(range(len(files)), weights=weights, k=1)[0]
     else:
-        # 关闭偏好：均匀随机
         idx = random.randrange(len(files))
 
-    # 组装返回
     pic = files[idx]
     rel = rels_all[idx]
     iid = ensure_image_record(rel, category)
     url = to_url(rel)
-
-    payload = {"id": iid,"relpath": rel, "url": url, "filename": pic.name, "category": category,}
+    payload = {
+        "id": iid,
+        "relpath": rel,
+        "filename": pic.name,
+        "category": category,
+        "url": url,
+    }
     if redirect:
         return RedirectResponse(url=url, status_code=302)
     return JSONResponse(payload)
+
 
 
 class RateIn(BaseModel):
@@ -421,7 +680,13 @@ def rate_image(body: RateIn):
         # ③ 计算新均分/次数
         new_cnt = old_cnt + 1
         new_avg = (old_avg * old_cnt + float(body.score)) / new_cnt
-
+#-----------
+        # ③.5 记录评分历史
+        conn.execute(
+            "INSERT INTO ratings(image_id, score, note, ts) VALUES (?,?,?,?)",
+            (db_id or file_id_for(rel), float(body.score), body.note, int(time.time()))
+        )
+        #--------
         # ④ 用 relpath 做 WHERE（不依赖 id 的类型/是否稳定）
         conn.execute(
             "UPDATE images SET cnt = ?, avg = ? WHERE relpath = ?",
@@ -458,3 +723,75 @@ def stats(id: Optional[str] = None, top: int = 50):
         else:
             cur = conn.execute("SELECT * FROM images ORDER BY avg DESC, cnt DESC LIMIT ?", (int(top),))
             return {"top": [dict(r) for r in cur.fetchall()]}
+
+from fastapi import Query
+from typing import List, Tuple
+
+def _like_escape(s: str) -> str:
+    # 逃逸 %, _ 和 \
+    return s.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+def _split_terms(q: str) -> List[str]:
+    q = (q or "").strip()
+    if not q:
+        return []
+    # 用空白切词；引号里视作短语
+    import shlex
+    try:
+        parts = [p for p in shlex.split(q) if p]
+    except Exception:
+        parts = [p for p in q.split() if p]
+    return parts
+
+def _build_like_where_and_args(terms: List[str]) -> Tuple[str, List[str]]:
+    """
+    WHERE ( i.relpath LIKE ? ESCAPE '\' OR i.filename LIKE ? ESCAPE '\' OR
+            EXISTS (SELECT 1 FROM image_tags t WHERE t.relpath=i.relpath AND t.tag LIKE ? ESCAPE '\') )
+    对每个 term 生成一组三个条件，然后 AND 串联（多词＝都要匹配）。
+    """
+    where_clauses = []
+    args: List[str] = []
+    for raw in terms:
+        t = _like_escape(raw)
+        # 前后都加 %，即包含匹配；英文/数字同样走包含
+        pat = f"%{t}%"
+        where_clauses.append(
+            "("
+            " i.relpath LIKE ? ESCAPE '\\' "
+            " OR i.filename LIKE ? ESCAPE '\\' "
+            " OR EXISTS (SELECT 1 FROM image_tags t WHERE t.relpath = i.relpath AND t.tag LIKE ? ESCAPE '\\') "
+            ")"
+        )
+        args.extend([pat, pat, pat])
+    where_sql = " AND ".join(where_clauses) if where_clauses else "1=1"
+    return where_sql, args
+
+@app.get("/search")
+def search(q: str = Query(..., description="模糊查询（标签/文件名/路径）"), limit: int = 10):
+    terms = _split_terms(q)
+    where_sql, args = _build_like_where_and_args(terms)
+
+    with db() as conn:
+        # 提前保证 filename 列存在
+        try:
+            conn.execute("ALTER TABLE images ADD COLUMN filename TEXT")
+        except Exception:
+            pass
+        # 回填 filename
+        conn.execute(
+            "UPDATE images SET filename = COALESCE(filename, substr(relpath, instr(reverse('/'||relpath), '/')+1)) "
+            "WHERE filename IS NULL OR filename=''"
+        )
+
+        sql = f"""
+            SELECT i.relpath, i.cnt, i.avg
+            FROM images i
+            WHERE {where_sql}
+            ORDER BY i.cnt ASC, i.avg DESC
+            LIMIT ?
+        """
+        cur = conn.execute(sql, (*args, limit))
+        rows = [{"relpath": r[0], "cnt": r[1], "avg": r[2]} for r in cur.fetchall()]
+    return {"q": q, "items": rows}
+
+

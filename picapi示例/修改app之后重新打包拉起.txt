@@ -1,0 +1,9 @@
+cd ~/astrbot
+docker compose -f ./astrbot.yml up -d --build picapi
+docker compose -f ./astrbot.yml logs -f picapi
+
+
+picapi文件夹在
+\\wsl$\Ubuntu\home\用户名\astrbot
+里
+
