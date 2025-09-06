@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field
 import shlex
 from fastapi import Query
 
+
 # 过滤：把我们写回的内部评分标签排除掉
 _TAG_BLACKLIST_PREFIXES = ("score:", "count:")
 _TAG_BLACKLIST_FIXED = {"rated"}
@@ -276,29 +277,103 @@ def _upsert_tags(conn, relpath: str, tags: list[str]):
     if rows:
         conn.executemany("INSERT OR IGNORE INTO image_tags(relpath, tag, tag_lc) VALUES (?,?,?)", rows)
 
+import os, time, subprocess, json
+from fastapi import Query
+
 @app.post("/sync_subjects")
 def sync_subjects(limit: int = 0):
     """
     扫描数据库中的图片，读取 XMP:Subject 写入 image_tags。
-    limit>0 时只处理最近的 N 条（按 rowid DESC，便于分批）。
+    limit > 0: 只处理最近 N 条（按 rowid DESC）
+    否则：只处理新增/修改过的文件（根据 mtime）
     """
     with db() as conn:
-        if limit and limit > 0:
-            cur = conn.execute("SELECT relpath FROM images ORDER BY rowid DESC LIMIT ?", (limit,))
-        else:
-            cur = conn.execute("SELECT relpath FROM images")
-        rels = [r[0] for r in cur.fetchall()]
+        cur = conn.cursor()
+        rows = cur.execute("SELECT relpath, last_ts FROM images ORDER BY rowid DESC" +
+                           (f" LIMIT {limit}" if limit > 0 else "")
+                          ).fetchall()
 
-        n = 0
-        for rel in rels:
-            abs_path = (GALLERY_DIR / rel).resolve()
-            tags = _extract_subjects_from_file(abs_path)
-            _upsert_tags(conn, rel, tags)
-            n += 1
-            if n % 200 == 0:
-                conn.commit()
-        conn.commit()
-    return {"processed": len(rels)}
+        todo = []
+        for relpath, last_ts in rows:
+            full = os.path.join(GALLERY_DIR, relpath)
+            try:
+                mtime = int(os.path.getmtime(full))
+            except FileNotFoundError:
+                continue
+            if limit > 0 or last_ts is None or mtime > (last_ts or 0):
+                todo.append((relpath, mtime))
+
+        if not todo:
+            return {"processed": 0}
+
+        # === 批量 exiftool ===
+        subjects = _batch_exif_subjects([rel for rel, _ in todo])
+
+        processed = 0
+        for relpath, mtime in todo:
+            tags = subjects.get(relpath, [])
+            cur.execute("DELETE FROM image_tags WHERE relpath=?", (relpath,))
+            for tag in tags:
+                cur.execute(
+                    "INSERT OR IGNORE INTO image_tags(relpath, tag, tag_lc) VALUES (?,?,?)",
+                    (relpath, tag, tag.lower())
+                )
+            cur.execute("UPDATE images SET last_ts=? WHERE relpath=?", (mtime, relpath))
+            processed += 1
+
+        return {"processed": processed}
+
+def _batch_exif_subjects(relpaths: list[str]) -> dict[str, list[str]]:
+    """
+    调用 exiftool 批量提取 XMP:Subject，返回 {relpath: [tags...]}
+    - 分片执行，避免命令行过长
+    - 过滤内部评分标签（rated / score: / count:）
+    - 去重、去空白
+    """
+    if not relpaths:
+        return {}
+
+    result: dict[str, list[str]] = {}
+    BATCH = 800  # 够大，也比较安全
+    for i in range(0, len(relpaths), BATCH):
+        chunk = relpaths[i:i+BATCH]
+        files = [os.path.join(GALLERY_DIR, r) for r in chunk]
+        cmd = ["exiftool", "-j", "-s", "-XMP:Subject"] + files
+
+        try:
+            out = subprocess.check_output(cmd, stderr=subprocess.DEVNULL)
+            data = json.loads(out.decode("utf-8", errors="ignore") or "[]")
+        except Exception:
+            continue
+
+        for item in data:
+            src = item.get("SourceFile")
+            if not src:
+                continue
+            rel = os.path.relpath(src, GALLERY_DIR)
+            subs = item.get("Subject", [])
+            if isinstance(subs, str):
+                subs = [subs]
+
+            clean = []
+            seen = set()
+            for t in subs or []:
+                s = str(t).strip()
+                if not s:
+                    continue
+                sl = s.lower()
+                if sl in _TAG_BLACKLIST_FIXED:
+                    continue
+                if any(sl.startswith(p) for p in _TAG_BLACKLIST_PREFIXES):
+                    continue
+                if s not in seen:
+                    seen.add(s)
+                    clean.append(s)
+
+            result[rel] = clean
+    return result
+
+
 
 #------------
 def _drop_legacy_objs(conn: sqlite3.Connection):
@@ -778,10 +853,15 @@ def search(q: str = Query(..., description="模糊查询（标签/文件名/路�
         except Exception:
             pass
         # 回填 filename
-        conn.execute(
-            "UPDATE images SET filename = COALESCE(filename, substr(relpath, instr(reverse('/'||relpath), '/')+1)) "
-            "WHERE filename IS NULL OR filename=''"
-        )
+        # 提前保证 filename 列存在
+        try:
+            conn.execute("ALTER TABLE images ADD COLUMN filename TEXT")
+        except Exception:
+            pass
+
+        # 用 Python 回填 filename（取 relpath 的最后一段）
+        for (rel,) in conn.execute("SELECT relpath FROM images WHERE filename IS NULL OR filename=''"):
+            conn.execute("UPDATE images SET filename=? WHERE relpath=?", (Path(rel).name, rel))
 
         sql = f"""
             SELECT i.relpath, i.cnt, i.avg
