@@ -9,7 +9,10 @@ from fastapi import Body  # 新增：用于接收 JSON body
 from pydantic import BaseModel, Field
 import shlex
 from fastapi import Query
+from threading import Lock
 
+_progress = {"phase":"idle", "total":0, "done":0, "started":0, "updated":0}
+_prog_lock = Lock()
 
 # 过滤：把我们写回的内部评分标签排除掉
 _TAG_BLACKLIST_PREFIXES = ("score:", "count:")
@@ -32,6 +35,16 @@ SCORE_PRECISION = int(os.environ.get("SCORE_PRECISION", "2"))
 
 app = FastAPI(title="Picture API with Ratings", version="2.0.0")
 app.mount(STATIC_PREFIX, StaticFiles(directory=str(GALLERY_DIR), html=False), name="static")
+
+def _set_prog(phase, total=0, done=0):
+    with _prog_lock:
+        _progress.update({"phase":phase, "total":int(total), "done":int(done),
+                          "started":int(time.time()), "updated":int(time.time())})
+
+def _tick_prog(n=1):
+    with _prog_lock:
+        _progress["done"] += int(n)
+        _progress["updated"] = int(time.time())
 
 def get_counts_for_rels(rels: List[str]) -> List[int]:
     """
@@ -62,6 +75,7 @@ def _assert_fts5_available():
 def db():
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA synchronous=NORMAL;")
     conn.execute("PRAGMA busy_timeout=5000;")  # 新增：最多等 5s
     conn.row_factory = sqlite3.Row
     return conn
@@ -284,44 +298,61 @@ from fastapi import Query
 def sync_subjects(limit: int = 0):
     """
     扫描数据库中的图片，读取 XMP:Subject 写入 image_tags。
-    limit > 0: 只处理最近 N 条（按 rowid DESC）
-    否则：只处理新增/修改过的文件（根据 mtime）
+    - limit > 0：只处理最近 N 条（按 rowid DESC）
+    - 否则：仅处理“新增/有变更（mtime > last_ts）”的文件
     """
+    # 1) 取出候选 rows（最近 N 条或全部）
     with db() as conn:
-        cur = conn.cursor()
-        rows = cur.execute("SELECT relpath, last_ts FROM images ORDER BY rowid DESC" +
-                           (f" LIMIT {limit}" if limit > 0 else "")
-                          ).fetchall()
+        sql = "SELECT rowid, relpath, last_ts FROM images ORDER BY rowid DESC"
+        if limit and limit > 0:
+            sql += " LIMIT ?"
+            rows = conn.execute(sql, (int(limit),)).fetchall()
+        else:
+            rows = conn.execute(sql).fetchall()
 
-        todo = []
-        for relpath, last_ts in rows:
-            full = os.path.join(GALLERY_DIR, relpath)
-            try:
-                mtime = int(os.path.getmtime(full))
-            except FileNotFoundError:
-                continue
-            if limit > 0 or last_ts is None or mtime > (last_ts or 0):
-                todo.append((relpath, mtime))
+    # 2) 生成待处理清单 todo = [(relpath, mtime), ...]
+    todo = []
+    for r in rows:
+        relpath = r["relpath"]
+        last_ts = int(r["last_ts"] or 0)
+        full = (GALLERY_DIR / relpath).resolve()
+        try:
+            mtime = int(full.stat().st_mtime)
+        except FileNotFoundError:
+            continue
+        if limit > 0 or last_ts == 0 or mtime > last_ts:
+            todo.append((relpath, mtime))
 
-        if not todo:
-            return {"processed": 0}
+    _set_prog("sync_subjects", total=len(todo), done=0)
+    if not todo:
+        _set_prog("idle", 0, 0)
+        return {"processed": 0}
 
-        # === 批量 exiftool ===
-        subjects = _batch_exif_subjects([rel for rel, _ in todo])
+    # 3) 批量抽取标签（过滤 rated/score:/count:）
+    subjects_map = _batch_exif_subjects([rel for rel, _ in todo])
 
-        processed = 0
+    # 4) 刷库：清旧标签→插入新标签→更新 last_ts（分批提交以免大事务）
+    processed = 0
+    with db() as conn:
         for relpath, mtime in todo:
-            tags = subjects.get(relpath, [])
-            cur.execute("DELETE FROM image_tags WHERE relpath=?", (relpath,))
-            for tag in tags:
-                cur.execute(
+            tags = subjects_map.get(relpath, [])
+            conn.execute("DELETE FROM image_tags WHERE relpath=?", (relpath,))
+            if tags:
+                conn.executemany(
                     "INSERT OR IGNORE INTO image_tags(relpath, tag, tag_lc) VALUES (?,?,?)",
-                    (relpath, tag, tag.lower())
+                    [(relpath, t, t.lower()) for t in tags]
                 )
-            cur.execute("UPDATE images SET last_ts=? WHERE relpath=?", (mtime, relpath))
+            conn.execute("UPDATE images SET last_ts=? WHERE relpath=?", (mtime, relpath))
             processed += 1
+            if processed % 200 == 0:
+                conn.commit()
+            _tick_prog(1)
+        conn.commit()
 
-        return {"processed": processed}
+    _set_prog("idle", 0, 0)
+    return {"processed": processed}
+
+
 
 def _batch_exif_subjects(relpaths: list[str]) -> dict[str, list[str]]:
     """
@@ -474,6 +505,11 @@ def _init_indices():
         conn.execute("CREATE INDEX IF NOT EXISTS idx_images_cat ON images(category)")
         conn.commit()
 
+
+@app.get("/admin/sync_progress")
+def sync_progress():
+    with _prog_lock:
+        return dict(_progress)  # {phase,total,done,started,updated}
 
 @app.post("/admin/nuke_legacy")
 def admin_nuke_legacy():

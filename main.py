@@ -1,11 +1,13 @@
 from typing import Dict, Any, Optional
 import os
-import httpx
 
 from astrbot.api import logger
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register
 import re
+import asyncio, time, httpx
+import contextlib  # new: _wait_with_progress 里用到了 suppress
+
 
 _CAT_HINT_RE = re.compile(r"[,:/]")
 
@@ -44,6 +46,7 @@ def _build_random_params(arg_text: str) -> dict:
 class PicRater(Star):
     def __init__(self, context: Context):
         super().__init__(context)
+        self.http_timeout = httpx.Timeout(connect=10.0, read=1200.0, write=1200.0, pool=10.0)
         # 与 docker-compose 在同一网络时可用服务名；需要的话用环境变量覆盖
         self.base_url = os.getenv("PICAPI_URL", "http://picapi:8000").rstrip("/")
         self.last_sent: Dict[str, Dict[str, Any]] = {}
@@ -74,17 +77,36 @@ class PicRater(Star):
 
     async def _get(self, path: str, **params):
         url = f"{self.base_url}{path}"
-        async with httpx.AsyncClient(timeout=15) as client:
+        async with httpx.AsyncClient(timeout=self.http_timeout) as client:
             r = await client.get(url, params={k: v for k, v in params.items() if v is not None and v != ""})
             r.raise_for_status()
             return r.json()
 
-    async def _post(self, path: str, payload: dict):
+    async def _post(self, path: str, payload):
         url = f"{self.base_url}{path}"
-        async with httpx.AsyncClient(timeout=15) as client:
+        async with httpx.AsyncClient(timeout=self.http_timeout) as client:
             r = await client.post(url, json=payload)
             r.raise_for_status()
             return r.json()
+
+    def _render_bar(self, done: int, total: int, width: int = 24) -> str:
+        if total <= 0:
+            return f"[{'?' * width}] ?% ({done}/?)"
+        pct = max(0.0, min(1.0, (done or 0) / float(total)))
+        fill = int(round(pct * width))
+        bar = "█" * fill + "░" * (width - fill)
+        return f"[{bar}] {int(pct * 100)}% ({done}/{total})"
+
+    async def _get_progress_json(self) -> dict | None:
+        import httpx
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                r = await client.get(f"{self.base_url}/admin/sync_progress")
+                if r.status_code == 200:
+                    return r.json()
+        except Exception:
+            pass
+        return None
 
     # --------- 指令 ----------
     # 用法：#来一张   或   #来一张 风景:3,人像:1   或   #来一张 壁纸/风景
@@ -208,47 +230,140 @@ class PicRater(Star):
         want_fts = any("fts" in tok for tok in tokens)
         return purge, batch, want_fts
 
-    @filter.command("整理图库")
-    async def cmd_maintain_gallery(self, event, text: str = ""):
+    async def _wait_with_progress(self, work_coro, event, label: str,
+                                  first_hint_after: float = 5.0,  # 首条提示在 5s 后
+                                  ping_every: float = 15.0,  # 之后每 15s 提示一次
+                                  hard_timeout: float | None = None):  # 设 None 表示不硬超时
         """
-        一键维护：
-          1) /reindex（可带清理）
-          2) /sync_subjects 分批同步 XMP Subject
-          3) （可选）重建 FTS
-        用法：
-          #整理图库
-          #整理图库 清理
-          #整理图库 清理 1000
-          #整理图库 1000 fts
+        等待一个协程执行完。超过 first_hint_after 秒开始提示，每 ping_every 秒提醒一次。
+        可选：hard_timeout 到达则取消任务并抛出 TimeoutError。
+        返回：work_coro 的结果。
         """
-        purge, batch, want_fts = self._parse_cleanup_batch_fts(text)
+        t0 = time.monotonic()
+        task = asyncio.create_task(work_coro)
+        hinted = False
         try:
-            # 1) 扫盘入库（可清理）
-            r1 = await self._reindex(purge)
-            indexed = r1.get("indexed")
-            purged  = r1.get("purged")
+            while True:
+                try:
+                    # 如果设置了硬超时（不建议），就用 wait_for 限制单次 wait 的最长时间
+                    if hard_timeout is not None:
+                        remaining = max(0.0, hard_timeout - (time.monotonic() - t0))
+                        res = await asyncio.wait_for(asyncio.shield(task), timeout=min(ping_every, remaining))
+                    else:
+                        res = await asyncio.wait_for(asyncio.shield(task), timeout=ping_every)
+                    return res  # 任务结束
 
-            # 2) 分批同步 XMP
-            total = await self._sync_subjects_all(batch=batch)
+                except asyncio.TimeoutError:
+                    # 任务还在跑
+                    elapsed = int(time.monotonic() - t0)
 
-            # 3) 可选 FTS 重建
-            fts_msg = ""
-            if want_fts:
-                fts_msg = await self._rebuild_fts_safe()
+                    # 试着拉一次后端进度（仅 sync_subjects 会有 total/done）
+                    prog = await self._get_progress_json()
+                    bar_txt = ""
+                    if prog and int(prog.get("total", 0)) > 0:
+                        bar_txt = " " + self._render_bar(int(prog.get("done", 0)),
+                                                         int(prog.get("total", 0)))
 
-            # 汇总消息
-            lines = [
-                f"已扫描入库：{indexed} 张",
-                f"已清理：{purged or 0} 条" if purged is not None else "未执行清理",
-                f"已同步 XMP 标签：{total} 张（批大小 {batch}）",
-            ]
-            if fts_msg:
-                lines.append(fts_msg)
 
-            yield event.plain_result("\n".join(lines))
-        except Exception as e:
-            yield event.plain_result(f"整理失败：{e}")
 
+                    # 硬超时可选
+                    if hard_timeout is not None and (time.monotonic() - t0) >= hard_timeout:
+                        task.cancel()
+                        raise TimeoutError(f"{label} 超过 {int(hard_timeout)}s 超时")
+
+        finally:
+            if not task.done():
+                # 清理
+                with contextlib.suppress(Exception):
+                    task.cancel()
+
+    @filter.command("整理图库")
+    async def cmd_clean_gallery(self, event, text: str = ""):
+        purge = self._parse_purge_flag(text)
+
+        # 第一条提示：必须用 yield（不能 await）
+        yield event.plain_result("开始整理图库：扫描入库 → 同步 XMP 标签…")
+
+        # ---------- 1) 扫盘入库 ----------
+        async def do_reindex():
+            import httpx
+            url = f"{self.base_url}/reindex"
+            async with httpx.AsyncClient(timeout=self.http_timeout) as client:
+                try:
+                    r = await client.post(url, json=purge)  # 兼容裸 boolean
+                    r.raise_for_status()
+                    return r.json()
+                except httpx.HTTPStatusError:
+                    r2 = await client.post(url, json={"purge_missing": purge})  # 兼容对象
+                    r2.raise_for_status()
+                    return r2.json()
+
+        import asyncio, time
+        # 入库阶段：轮询任务 + 心跳提示
+        t0 = time.monotonic()
+        task1 = asyncio.create_task(do_reindex())
+        first_hint_after = 5.0
+        ping_every = 15.0
+        next_ping = t0 + first_hint_after
+        resp1 = None
+        while True:
+            try:
+                resp1 = await asyncio.wait_for(asyncio.shield(task1), timeout=1.0)
+                break
+            except asyncio.TimeoutError:
+                now = time.monotonic()
+                if now >= next_ping:
+                    elapsed = int(now - t0)
+                    # 入库没有 total/done，就发心跳
+                    yield event.plain_result(f"⏳ 扫盘入库进行中（已用时 {elapsed}s）")
+                    next_ping = now + ping_every
+
+        if not isinstance(resp1, dict):
+            yield event.plain_result(f"❌ 扫盘入库失败：返回内容异常：{resp1!r}")
+            return
+
+        # ---------- 2) 同步 XMP ----------
+        async def do_sync_all():
+            import httpx
+            async with httpx.AsyncClient(timeout=self.http_timeout) as client:
+                r = await client.post(f"{self.base_url}/sync_subjects", params={"limit": 0})
+                r.raise_for_status()
+                return r.json()
+
+        t1 = time.monotonic()
+        task2 = asyncio.create_task(do_sync_all())
+        next_ping = t1 + first_hint_after
+        resp2 = None
+        while True:
+            try:
+                resp2 = await asyncio.wait_for(asyncio.shield(task2), timeout=1.0)
+                break
+            except asyncio.TimeoutError:
+                now = time.monotonic()
+                if now >= next_ping:
+                    elapsed = int(now - t1)
+                    # 这个阶段可以试着拉进度条（如果后端实现了 /progress）
+                    prog = await self._get_progress_json()
+                    bar_txt = ""
+                    if prog and int(prog.get("total", 0)) > 0:
+                        bar_txt = " " + self._render_bar(int(prog.get("done", 0)),
+                                                         int(prog.get("total", 0)))
+                    yield event.plain_result(f"⏳ 同步 XMP 标签进行中（已用时 {elapsed}s）{bar_txt}")
+                    next_ping = now + ping_every
+
+        if not isinstance(resp2, dict):
+            yield event.plain_result(f"❌ 同步标签失败：返回内容异常：{resp2!r}")
+            return
+
+        # ---------- 汇总 ----------
+        indexed = resp1.get("indexed")
+        purged = resp1.get("purged")
+        processed = resp2.get("processed")
+        msg = f"✅ 完成：入库 {indexed} 条"
+        if purged is not None:
+            msg += f"，清理 {purged} 条"
+        msg += f"，同步标签 {processed} 条。"
+        yield event.plain_result(msg)
 
     # 用法：#/评分 4.5   或   #/评分 4 不错
     @filter.command("评分")
