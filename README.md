@@ -11,6 +11,8 @@
 
 ## 🧠 功能概览
 
+由于我在astrbot里改了机器人唤醒符号 / → #，默认是/，下文用#表示唤醒符号，如果默认请用/代替#。
+
 * `#来一张 [关键词|分类表达式]`
 
   * 支持两种模式：
@@ -26,7 +28,7 @@
 
 * `#图类目`
 
-  * 列出顶级分类（图库顶层文件夹）。
+  * 列出分类（图库文件夹）。可以进一步访问子文件夹。例如：#图类目 pictures
 
 * `#整理图库 [清理]`
 
@@ -36,32 +38,68 @@
     2. 全量同步 XMP\:Subject → 数据库 tags
     3. 重建 FTS 索引（用于模糊搜索）
 
+新增用：#整理图库
+删改+新增用：#整理图库 清理
+
 ---
 
 ## 🚀 快速上手
 
-1）**起后端 picapi**（Docker）
+如果你没有picapi后端，也不想自己写：
 
-```yaml
-services:
+（库里有picapi示例，你可以把中文删掉，剪切到\\wsl$\Ubuntu\home\nero\astrbot，从这一步开始做起）
+
+1）**起后端 picapi**（Docker）
+以astrbot.yml举例，在ubuntu输入
+cd ~/astrbot
+nano astrbot.yml
+
+或者\\wsl$\Ubuntu\home\用户名\astrbot
+修改txt astrbot.yml
+
+```
   picapi:
-    build: ./picapi
+    build:
+      context: ./picapi
     container_name: picapi
     environment:
       - TZ=Asia/Shanghai
-      - PICK_BIAS=min
-      - OVERWRITE_SUBJECT_SCORE=true
-      - WRITE_META_MIN_COUNT=1
       - ALLOWED_SUFFIXES=.jpg,.jpeg,.png,.gif,.webp
       - STATIC_PREFIX=/static
       - RECURSIVE=true
+      - WRITE_META_MIN_COUNT=1     # 累计评分次数达到多少就写元数据
+      - SCORE_PRECISION=2          # 均分保留几位小数
+      - PICK_BIAS=min           # 默认“评分次数最少优先”
+      - PICK_BIAS_ALPHA=1.0     # 仅 weighted 时有效
+      - SKIP_FTS_INIT=1
     volumes:
-      - /mnt/c/Users/YourName/Pictures/gallery:/data/gallery
-      - picdb:/data/db
-    ports: ["8000:8000"]
+      - "/mnt/c/Users/Admin/Pictures/gallery:/data/gallery/pictures"    # ← 你要随机的图片就放到 ./gallery 这个目录
+      - "/mnt/d/_Game/setu/share:/data/gallery/share"  #其他分盘的目录，根据需求自己改变路径
+      - picdb:/data/db             # ← 存评分统计的 sqlite
+    ports:
+      - "8000:8000"                # API 对外映射端口
     restart: always
-    networks: [astrbot_network]
+    networks:
+      - astrbot_network
+
+volumes:
+  picdb: {}   # ← 新增：声明 picdb 卷（必需）
+
+networks:
+  astrbot_network:
+    driver: bridge
 ```
+根据自己的路径修改，然后ctrl+O 回车 ctrl+X退出编辑（ubuntu），如果是修改txt则直接保存。
+
+然后在docker desktop里面setting（设置）→ resources→File sharing（文件共享）增加  volumes:里面提到的前半段的路径，如果你是像我这样使用本地硬盘的话。Apply，然后右键restart docker desktop。
+
+在astrbot的目录下，终端或者ubuntu：
+```
+docker compose -f ./astrbot.yml up -d --build picapi
+```
+重建容器。
+
+
 
 2）**放置插件**
 
@@ -77,7 +115,6 @@ services:
 环境变量（可选）：
 
 * `PICAPI_URL`（默认 `http://picapi:8000`）
-* `PICAPI_TIMEOUT`（默认 15 秒）
 
 ---
 

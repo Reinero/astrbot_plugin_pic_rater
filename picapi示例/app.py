@@ -659,6 +659,54 @@ def health():
 def categories():
     return {"categories": list_top_categories()}
 
+def _safe_join_under_gallery(sub: str) -> Path:
+    """
+    把用户传入的相对路径拼到 GALLERY_DIR 下，并做越界保护。
+    """
+    p = (GALLERY_DIR / (sub.strip("/"))) if sub else GALLERY_DIR
+    p = p.resolve()
+    g = GALLERY_DIR.resolve()
+    try:
+        p.relative_to(g)
+    except Exception:
+        raise HTTPException(status_code=400, detail="path out of gallery")
+    return p
+
+@app.get("/dirs")
+def list_subdirs(path: str = ""):
+    """
+    列出 path（相对图库根）下的**直接子文件夹**。
+    返回相对 GALLERY_DIR 的子路径，并附带该子路径下（递归）图片文件数量。
+    """
+    base = _safe_join_under_gallery(path)
+    if not base.exists() or not base.is_dir():
+        raise HTTPException(status_code=404, detail="path not found")
+
+    # 只列一层目录
+    subdirs = []
+    for child in sorted(base.iterdir()):
+        if child.is_dir():
+            # 统计该子目录下的图片数量（递归）
+            cnt = 0
+            for root, _, files in os.walk(child):
+                for fn in files:
+                    if _is_image_file(Path(root) / fn):
+                        cnt += 1
+            rel = child.relative_to(GALLERY_DIR).as_posix()
+            subdirs.append({"path": rel, "name": child.name, "count": cnt})
+
+    # 当前层里的图片数量（非必须，仅用于提示）
+    this_level_files = 0
+    for fn in (f for f in base.iterdir() if f.is_file() and _is_image_file(f)):
+        this_level_files += 1
+
+    return {
+        "base": (base.relative_to(GALLERY_DIR).as_posix() if base != GALLERY_DIR else ""),
+        "dirs": subdirs,
+        "files_here": this_level_files,
+    }
+
+
 @app.get("/random_pic")
 def random_pic(
     cat: Optional[str] = Query(default=None, description="分类过滤，支持权重：风景 或 风景,人像 或 风景:3,人像:1；支持多级：壁纸/风景"),

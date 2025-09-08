@@ -75,15 +75,15 @@ class PicRater(Star):
             u = "/" + u
         return f"{self.base_url}{u}"
 
-    async def _get(self, path: str, **params):
-        url = f"{self.base_url}{path}"
+    async def _get(self, endpoint: str, **params):
+        url = f"{self.base_url}{endpoint}"
         async with httpx.AsyncClient(timeout=self.http_timeout) as client:
             r = await client.get(url, params={k: v for k, v in params.items() if v is not None and v != ""})
             r.raise_for_status()
             return r.json()
 
-    async def _post(self, path: str, payload):
-        url = f"{self.base_url}{path}"
+    async def _post(self, endpoint: str, payload):
+        url = f"{self.base_url}{endpoint}"
         async with httpx.AsyncClient(timeout=self.http_timeout) as client:
             r = await client.post(url, json=payload)
             r.raise_for_status()
@@ -418,17 +418,59 @@ class PicRater(Star):
         # 都失败了
         yield event.plain_result(f"评分失败：服务器找不到对应图片（尝试键：{tried}）。请先重新来一张。")
 
-    # 用法：#/图类目
+    # 用法：
+    #   #图类目                 -> 显示顶级分类
+    #   #图类目 pictures        -> 显示 pictures 下的子文件夹
+    #   #图类目 pictures/壁纸   -> 再下一级
     @filter.command("图类目")
     async def cmd_categories(self, event: AstrMessageEvent, text: str = ""):
+        arg = (text or "").strip().strip("/")
         try:
-            data = await self._get("/categories")
-            cats = data.get("categories", [])
-            if not cats:
-                yield event.plain_result("没有检测到分类（顶级子文件夹）。")
+            if not arg:
+                # 顶级：仍用 /categories
+                data = await self._get("/categories")
+                cats = data.get("categories", [])
+                if not cats:
+                    yield event.plain_result("没有检测到分类（顶级子文件夹）。")
+                    return
+                joined = "、".join(cats[:100])
+                tip = (
+                    f"顶级分类（前{min(100, len(cats))}个）：\n{joined}\n\n"
+                    f"下钻查看子文件夹示例：\n#图类目 {cats[0]}\n"
+                    f"直接按分类发图示例：\n#来一张 {cats[0]}"
+                )
+                yield event.plain_result(tip)
                 return
-            joined = "、".join(cats[:100])
-            yield event.plain_result(f"顶级分类（前{min(100,len(cats))}个）：\n{joined}\n例如：#来一张 {cats[0]}")
+
+            # 带路径：用 /dirs?path=...
+            data = await self._get("/dirs", path=arg)
+            base = data.get("base", "")
+            entries = data.get("dirs", [])
+            files_here = data.get("files_here", 0)
+
+            if not entries and files_here == 0:
+                yield event.plain_result(f"‘{arg}’ 下没有子文件夹与图片。")
+                return
+
+            # 排序：按图片数降序，再按名字
+            entries_sorted = sorted(entries, key=lambda d: (-int(d.get("count", 0)), d.get("name", "")))
+
+            # 只展示前 120 项，避免刷屏
+            show = entries_sorted[:120]
+            lines = [f"📂 {base or '/'} 下的子文件夹（显示前 {len(show)} 项）:"]
+            for d in show:
+                name = d.get("name", "")
+                path = d.get("path", "")
+                cnt = int(d.get("count", 0))
+                lines.append(f"- {name}  ({cnt} 张)   →  下钻：#图类目 {path}   |  发图：#来一张 {path}")
+
+            if files_here:
+                lines.append(f"\n此外，‘{base or '/'}’ 目录本层还有 {files_here} 张图片。发图示例：#来一张 {base or '/'}")
+
+            yield event.plain_result("\n".join(lines))
+
         except Exception as e:
+            from astrbot.api import logger
             logger.error(f"[pic_rater] /图类目 失败: {e}")
             yield event.plain_result("获取分类失败：请检查 picapi 是否在线。")
+
