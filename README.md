@@ -47,7 +47,7 @@
 
 如果你没有picapi后端，也不想自己写：
 
-（库里有picapi示例，你可以把中文删掉，剪切到\\wsl$\Ubuntu\home\nero\astrbot，从这一步开始做起）
+（库里有picapi示例，你可以把中文删掉，剪切到\\wsl$\Ubuntu\home\用户名\astrbot，从这一步开始做起）
 
 1）**起后端 picapi**（Docker）
 以astrbot.yml举例，在ubuntu输入
