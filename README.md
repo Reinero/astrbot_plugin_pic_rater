@@ -2,16 +2,33 @@
 
 `astrbot_plugin_pic_rater` 是一个 **AstrBot 插件项目**：  
 - 前端交互层是 AstrBot 指令插件（本仓库根目录）。  
-- 图片服务层是 `picapi`（建议 Docker 部署）。  
+- 图片服务层是 **独立服务 `picapi`**（建议 Docker 部署，代码已从本仓库剥离）。  
 
 整体目标：随机发图、标签检索、评分统计、XMP 元数据回写。
 
 ## 快速启动
 
-1. 使用 Docker 启动 `picapi`（参考 `picapi/docker-compose.example` 和 `picapi/.env.example`）。  
+1. 使用 Docker 启动独立 `picapi` 服务（本仓库不再包含服务端代码）。  
 2. 将本项目作为插件放入 AstrBot：`data/plugins/astrbot_plugin_pic_rater`。  
-3. 配置插件环境变量 `PICAPI_URL`（默认 `http://picapi:8000`）。  
+3. 在 AstrBot 面板配置 `picapi_url`（默认 `http://picapi:8000`）。  
 4. 在 AstrBot 面板启用/重载插件。  
+
+---
+
+## 插件配置（WebUI）
+
+本插件在根目录提供 `_conf_schema.json`，AstrBot 会自动在管理面板生成可视化配置，并写入
+`data/config/astrbot_plugin_pic_rater_config.json`。
+
+当前关键配置项：
+- `picapi_url`：picapi API 基址（默认 `http://picapi:8000`）
+- `http_timeout`：`connect/read/write/pool` 超时
+- `message.show_image_meta`：发图后是否展示元信息
+- `message.show_usage_on_invalid_score`：评分输入错误时是否提示用法
+- `sync_progress.first_hint_after_sec`：整理图库首次进度提示时间
+- `sync_progress.ping_every_sec`：整理图库进度提示间隔
+- `sync_progress.show_progress_bar`：是否显示同步进度条
+- `command_aliases.cleanup_keywords`：触发“清理模式”的关键词列表
 
 ---
 
@@ -96,24 +113,15 @@ flowchart LR
 
 ### 插件模块（AstrBot）
 - `main.py`：插件入口（薄封装）
-- `plugin/commands.py`：指令处理（来一张/评分/类目/整理）
-- `plugin/picapi_client.py`：HTTP 客户端与请求封装
-- `plugin/parsers.py`：参数解析（关键词/分类、评分解析等）
-- `plugin/session_store.py`：会话态缓存（last sent image）
+- `__init__.py`：插件包标识（可为空）
+- `_conf_schema.json`：插件配置 Schema（WebUI 可视化）
+- `requirements.txt`：插件依赖（仅 HTTP 调用所需）
+- `metadata.yaml`：插件元信息
+- `README.md`：插件使用说明
 
-### 后端模块（picapi）
-- `picapi/app.py`：FastAPI 应用装配、异常处理、启动迁移
-- `picapi/api/routes.py`：路由层（HTTP interface）
-- `picapi/services/gallery_service.py`：图库、检索、索引、FTS 逻辑
-- `picapi/services/rating_service.py`：评分聚合与回写流程
-- `picapi/infra/db.py`：数据库连接与事务
-- `picapi/infra/metadata.py`：ExifTool 读写
-- `picapi/infra/migrations.py`：schema 迁移入口
-- `picapi/models.py`：请求/响应 DTO（Pydantic）
+### 独立服务（picapi）
 
-### 文档与测试
-- `docs/baseline_audit.md`：重构基线与回归清单
-- `tests/`：解析与检索核心单元测试
+`picapi` 为独立部署服务，已从本仓库剥离为单独项目/仓库（Docker 运行）。插件仅通过 HTTP 调用它的接口。
 
 ---
 

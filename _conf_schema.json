@@ -1,7 +1,92 @@
 {
-  "PICAPI_URL": {
+  "picapi_url": {
     "type": "string",
     "default": "http://picapi:8000",
-    "description": "图片 API 基址（容器内访问）"
+    "description": "picapi 服务地址",
+    "hint": "Docker 同网络建议使用 http://picapi:8000；也可填写 http://<host>:8000",
+    "obvious_hint": true
+  },
+  "http_timeout": {
+    "type": "object",
+    "description": "HTTP 超时配置（秒）",
+    "items": {
+      "connect": {
+        "type": "float",
+        "default": 10.0,
+        "description": "连接超时"
+      },
+      "read": {
+        "type": "float",
+        "default": 1200.0,
+        "description": "读取超时"
+      },
+      "write": {
+        "type": "float",
+        "default": 1200.0,
+        "description": "写入超时"
+      },
+      "pool": {
+        "type": "float",
+        "default": 10.0,
+        "description": "连接池等待超时"
+      }
+    }
+  },
+  "message": {
+    "type": "object",
+    "description": "交互消息配置",
+    "items": {
+      "show_image_meta": {
+        "type": "bool",
+        "default": true,
+        "description": "发送图片后是否展示 ID/分类/文件名"
+      },
+      "show_usage_on_invalid_score": {
+        "type": "bool",
+        "default": true,
+        "description": "评分参数错误时是否提示用法"
+      }
+    }
+  },
+  "sync_progress": {
+    "type": "object",
+    "description": "整理图库进度提示策略",
+    "items": {
+      "first_hint_after_sec": {
+        "type": "int",
+        "default": 5,
+        "description": "首次提示延迟（秒）"
+      },
+      "ping_every_sec": {
+        "type": "int",
+        "default": 15,
+        "description": "后续提示间隔（秒）"
+      },
+      "show_progress_bar": {
+        "type": "bool",
+        "default": true,
+        "description": "同步标签阶段是否附带进度条"
+      }
+    }
+  },
+  "command_aliases": {
+    "type": "object",
+    "description": "命令别名配置",
+    "items": {
+      "cleanup_keywords": {
+        "type": "list",
+        "default": [
+          "清理",
+          "purge",
+          "cleanup",
+          "clean",
+          "true",
+          "1",
+          "是",
+          "yes"
+        ],
+        "description": "触发 #整理图库 清理模式的关键词列表"
+      }
+    }
   }
 }
