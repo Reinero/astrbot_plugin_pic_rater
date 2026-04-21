@@ -1,0 +1,28 @@
+services:
+  picapi:
+    build:
+      context: ./picapi
+    container_name: picapi
+    env_file:
+      - .env.example
+    volumes:
+      - ./gallery:/data/gallery/pictures
+      - /run/desktop/mnt/host/d/_Game/setu/share:/data/gallery/share
+      - picdb:/data/db             # ← 存评分统计的 sqlite
+    ports:
+      - "8000:8000"                # API 对外映射端口
+    restart: always
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health').read()"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    networks:
+      - astrbot_network
+
+volumes:
+  picdb: {}   # ← 新增：声明 picdb 卷（必需）
+
+networks:
+  astrbot_network:
+    driver: bridge
