@@ -95,10 +95,11 @@ class _PicApiClient:
             r.raise_for_status()
             return r.json()
 
-    async def post(self, endpoint: str, payload: Any):
+    async def post(self, endpoint: str, payload: Any, **params):
         url = f"{self.base_url}{endpoint}"
+        query = {k: v for k, v in params.items() if v is not None and v != ""}
         async with httpx.AsyncClient(timeout=self.timeout) as client:
-            r = await client.post(url, json=payload)
+            r = await client.post(url, params=query, json=payload)
             r.raise_for_status()
             return r.json()
 
@@ -197,10 +198,8 @@ class PicRater(Star):
         yield event.plain_result("开始整理图库：扫描入库 → 同步 XMP 标签…")
 
         async def do_reindex():
-            try:
-                return await self.client.post("/reindex", purge)
-            except Exception:
-                return await self.client.post("/reindex", {"purge_missing": purge})
+            # Keep request format stable: /reindex accepts boolean body.
+            return await self.client.post("/reindex", purge)
 
         t0 = time.monotonic()
         task = asyncio.create_task(do_reindex())
@@ -221,7 +220,8 @@ class PicRater(Star):
             return
 
         t1 = time.monotonic()
-        task2 = asyncio.create_task(self.client.post("/sync_subjects", {}))
+        # Explicitly pass sync_subjects default limit via query for protocol clarity.
+        task2 = asyncio.create_task(self.client.post("/sync_subjects", {}, limit=0))
         next_ping = t1 + max(0, self.first_hint_after)
         while True:
             try:
@@ -312,6 +312,23 @@ class PicRater(Star):
         except Exception as e:
             logger.error("[pic_rater] /图类目 失败: %s", e)
             yield event.plain_result("获取分类失败：请检查 picapi 是否在线。")
+
+    @filter.command("服务状态")
+    async def cmd_health(self, event: AstrMessageEvent):
+        try:
+            data = await self.client.get("/health")
+            lines = [
+                f"服务状态: {'OK' if data.get('ok') else 'UNKNOWN'}",
+                f"图库目录: {data.get('gallery')}",
+                f"递归扫描: {data.get('recursive')}",
+                f"支持后缀: {','.join(data.get('allowed_suffixes', []))}",
+                f"顶级分类数: {len(data.get('top_categories', []))}",
+                f"图片总数: {data.get('total_files')}",
+            ]
+            yield event.plain_result("\n".join(lines))
+        except Exception as e:
+            logger.error("[pic_rater] /服务状态 失败: %s", e)
+            yield event.plain_result("获取服务状态失败：请检查 picapi 是否在线。")
 
 
 __all__ = ["PicRater"]
